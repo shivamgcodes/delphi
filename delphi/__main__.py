@@ -11,6 +11,7 @@ from simple_parsing import ArgumentParser
 from torch import Tensor
 from transformers import (
     AutoModel,
+    AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
     PreTrainedModel,
@@ -24,6 +25,7 @@ from delphi.config import RunConfig
 from delphi.explainers import ContrastiveExplainer, DefaultExplainer, NoOpExplainer
 from delphi.explainers.explainer import ExplainerResult
 from delphi.latents import LatentCache, LatentDataset
+from delphi.latents.cache_moe import MoELatentCache
 from delphi.latents.neighbours import NeighbourCalculator
 from delphi.log.result_analysis import log_results
 from delphi.pipeline import Pipe, Pipeline, process_wrapper
@@ -64,6 +66,133 @@ def load_artifacts(run_cfg: RunConfig):
         model,
         transcode,
     )
+
+
+def load_moe_artifacts(run_cfg: RunConfig):
+    """
+    Load model and MoE wrapper for MoE mode.
+
+    Args:
+        run_cfg: Run configuration.
+
+    Returns:
+        Tuple of (hookpoints, model, wrapper) where hookpoints are MoE layer names.
+    """
+    import sys
+    from pathlib import Path
+
+    # Make slice package accessible (slice is at SPAR/slice, not SPAR/delphi/slice)
+    slice_path = Path(__file__).parent.parent.parent / "slice" / "src"
+    if str(slice_path) not in sys.path:
+        sys.path.insert(0, str(slice_path))
+
+    from expert_construction.model_converter import ModelWrapper
+
+    if run_cfg.load_in_8bit:
+        dtype = torch.float16
+    elif torch.cuda.is_bf16_supported():
+        dtype = torch.bfloat16
+    else:
+        dtype = "auto"
+
+    model = AutoModelForCausalLM.from_pretrained(
+        run_cfg.model,
+        device_map={"": "cuda"},
+        quantization_config=(
+            BitsAndBytesConfig(load_in_8bit=run_cfg.load_in_8bit)
+            if run_cfg.load_in_8bit
+            else None
+        ),
+        torch_dtype=dtype,
+        token=run_cfg.hf_token,
+    )
+    model.eval()
+
+    # Load MoE wrapper
+    if not run_cfg.moe_wrapper_path:
+        raise ValueError("moe_wrapper_path must be provided when moe_mode=True")
+
+    wrapper_checkpoint = torch.load(run_cfg.moe_wrapper_path)
+    wrapper = ModelWrapper(**wrapper_checkpoint["kwargs"])
+    wrapper.load_state_dict(wrapper_checkpoint["state_dict"])
+    wrapper.attach_layers(model)
+
+    logger.info(f"Loaded MoE wrapper from {run_cfg.moe_wrapper_path}")
+    logger.info(f"Number of MoE layers: {len(wrapper.moe_layers)}")
+
+    # Generate hookpoint names
+    hookpoints = [f"moe_layer_{i}" for i in range(len(wrapper.moe_layers))]
+
+    return hookpoints, model, wrapper
+
+
+def populate_moe_cache(
+    run_cfg: RunConfig,
+    model: PreTrainedModel,
+    wrapper,
+    latents_path: Path,
+    tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
+):
+    """
+    Populates an on-disk cache with MoE router probabilities.
+
+    Args:
+        run_cfg: Run configuration.
+        model: The model with MoE wrapper attached.
+        wrapper: The ModelWrapper instance.
+        latents_path: Path to save cached router probabilities.
+        tokenizer: Tokenizer for the model.
+    """
+    latents_path.mkdir(parents=True, exist_ok=True)
+
+    # Create a log path within the run directory
+    log_path = latents_path.parent / "log"
+    log_path.mkdir(parents=True, exist_ok=True)
+
+    cache_cfg = run_cfg.cache_cfg
+    tokens = load_tokenized_data(
+        cache_cfg.cache_ctx_len,
+        tokenizer,
+        cache_cfg.dataset_repo,
+        cache_cfg.dataset_split,
+        cache_cfg.dataset_name,
+        cache_cfg.dataset_column,
+        run_cfg.seed,
+    )
+
+    if run_cfg.filter_bos:
+        if tokenizer.bos_token_id is None:
+            print("Tokenizer does not have a BOS token, skipping BOS filtering")
+        else:
+            flattened_tokens = tokens.flatten()
+            mask = ~torch.isin(flattened_tokens, torch.tensor([tokenizer.bos_token_id]))
+            masked_tokens = flattened_tokens[mask]
+            truncated_tokens = masked_tokens[
+                : len(masked_tokens) - (len(masked_tokens) % cache_cfg.cache_ctx_len)
+            ]
+            tokens = truncated_tokens.reshape(-1, cache_cfg.cache_ctx_len)
+
+    cache = MoELatentCache(
+        model,
+        wrapper,
+        batch_size=cache_cfg.batch_size,
+        top_k_only=run_cfg.moe_top_k_only,
+        log_path=log_path,
+    )
+    cache.run(cache_cfg.n_tokens, tokens)
+
+    if run_cfg.verbose:
+        logger.info(
+            f"MoE caching complete. Top-k only: {run_cfg.moe_top_k_only}, "
+            f"Number of experts: {cache.width}"
+        )
+
+    cache.save_splits(
+        n_splits=cache_cfg.n_splits,
+        save_dir=latents_path,
+    )
+
+    cache.save_config(save_dir=latents_path, cfg=cache_cfg, model_name=run_cfg.model)
 
 
 def create_neighbours(
@@ -401,26 +530,47 @@ async def run(
 
     latent_range = torch.arange(run_cfg.max_latents) if run_cfg.max_latents else None
 
-    hookpoints, hookpoint_to_sparse_encode, model, transcode = load_artifacts(run_cfg)
     tokenizer = AutoTokenizer.from_pretrained(run_cfg.model, token=run_cfg.hf_token)
 
-    nrh = assert_type(
-        dict,
-        non_redundant_hookpoints(
-            hookpoint_to_sparse_encode, latents_path, "cache" in run_cfg.overwrite
-        ),
-    )
-    if nrh:
-        populate_cache(
-            run_cfg,
-            model,
-            nrh,
-            latents_path,
-            tokenizer,
-            transcode,
-        )
+    # Branch based on MoE mode
+    if run_cfg.moe_mode:
+        # MoE router caching path
+        hookpoints, model, wrapper = load_moe_artifacts(run_cfg)
 
-    del model, hookpoint_to_sparse_encode
+        # Check if caching is needed
+        if "cache" in run_cfg.overwrite or not any(
+            (latents_path / hp).exists() for hp in hookpoints
+        ):
+            populate_moe_cache(
+                run_cfg,
+                model,
+                wrapper,
+                latents_path,
+                tokenizer,
+            )
+
+        del model, wrapper
+    else:
+        # Standard SAE caching path
+        hookpoints, hookpoint_to_sparse_encode, model, transcode = load_artifacts(run_cfg)
+
+        nrh = assert_type(
+            dict,
+            non_redundant_hookpoints(
+                hookpoint_to_sparse_encode, latents_path, "cache" in run_cfg.overwrite
+            ),
+        )
+        if nrh:
+            populate_cache(
+                run_cfg,
+                model,
+                nrh,
+                latents_path,
+                tokenizer,
+                transcode,
+            )
+
+        del model, hookpoint_to_sparse_encode
     if run_cfg.constructor_cfg.non_activating_source == "neighbours":
         nrh = assert_type(
             list,

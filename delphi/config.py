@@ -227,3 +227,12 @@ class RunConfig(Serializable):
 
     """List of run stages to recompute. This is a debugging tool
     and may be removed in the future."""
+
+    moe_mode: bool = False
+    """Enable MoE router caching instead of SAE latent caching."""
+
+    moe_wrapper_path: str = ""
+    """Path to the saved ModelWrapper checkpoint (.pt file) for MoE mode."""
+
+    moe_top_k_only: bool = True
+    """Whether to zero out non-top-k router probabilities before caching (for sparsity)."""

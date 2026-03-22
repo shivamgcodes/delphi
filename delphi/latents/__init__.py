@@ -1,4 +1,5 @@
 from .cache import LatentCache
+from .cache_moe import MoELatentCache
 from .constructors import (
     constructor,
     neighbour_non_activation_windows,
@@ -17,6 +18,7 @@ from .samplers import sampler
 
 __all__ = [
     "LatentCache",
+    "MoELatentCache",
     "LatentDataset",
     "Latent",
     "LatentRecord",
