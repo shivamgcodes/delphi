@@ -82,11 +82,12 @@ def load_moe_artifacts(run_cfg: RunConfig):
     from pathlib import Path
 
     # Make slice package accessible (slice is at SPAR/slice, not SPAR/delphi/slice)
-    slice_path = Path(__file__).parent.parent.parent / "slice" / "src"
+    # slice uses "from src.expert_construction..." so we need /workspace/slice in path
+    slice_path = Path(__file__).parent.parent.parent / "slice"
     if str(slice_path) not in sys.path:
         sys.path.insert(0, str(slice_path))
 
-    from expert_construction.model_converter import ModelWrapper
+    from src.expert_construction.model_converter import ModelWrapper
 
     if run_cfg.load_in_8bit:
         dtype = torch.float16
