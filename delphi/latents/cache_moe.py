@@ -122,6 +122,13 @@ class MoELatentCache:
                     for layer_idx, moe_layer in enumerate(self.wrapper.moe_layers):
                         hookpoint = f"moe_layer_{layer_idx}"
                         router_probs = moe_layer._router_probs  # [batch, seq, num_experts]
+                        
+                        # Ensure router_probs has the right shape
+                        if router_probs.dim() == 2:
+                            # If [batch*seq, num_experts], reshape to [batch, seq, num_experts]
+                            batch_size = batch.shape[0]
+                            seq_len = batch.shape[1]
+                            router_probs = router_probs.view(batch_size, seq_len, -1)
 
                         # Optionally apply top-k sparsification
                         if self.top_k_only:
