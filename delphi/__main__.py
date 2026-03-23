@@ -551,6 +551,7 @@ async def run(
             )
 
         del model, wrapper
+        torch.cuda.empty_cache()
     else:
         # Standard SAE caching path
         hookpoints, hookpoint_to_sparse_encode, model, transcode = load_artifacts(run_cfg)
