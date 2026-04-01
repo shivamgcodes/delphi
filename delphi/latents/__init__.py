@@ -1,5 +1,4 @@
 from .cache import LatentCache
-from .cache_moe import MoELatentCache
 from .constructors import (
     constructor,
     neighbour_non_activation_windows,
@@ -15,6 +14,15 @@ from .latents import (
 )
 from .loader import LatentDataset
 from .samplers import sampler
+
+
+def __getattr__(name: str):
+    if name == "MoELatentCache":
+        from delphi.latents.cache_moe import MoELatentCache
+
+        return MoELatentCache
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "LatentCache",

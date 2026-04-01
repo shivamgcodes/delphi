@@ -22,12 +22,14 @@ import importlib
 import json
 import os
 import sys
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import torch
+import torch.nn as nn
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 
@@ -36,6 +38,26 @@ def _slice_repo_root() -> Path:
     if env:
         return Path(env).expanduser().resolve()
     return Path(__file__).resolve().parent.parent.parent.parent / "slice"
+
+
+def _duck_type_moe_layer(module: nn.Module) -> bool:
+    """Detect SLICE MoE blocks when ``BaseMoEArchitecture`` is not importable (slim repos)."""
+    return hasattr(module, "_last_routing_probs") and hasattr(module, "num_experts")
+
+
+_moe_layer_predicate: Callable[[nn.Module], bool] = _duck_type_moe_layer
+
+
+def _set_moe_layer_predicate(base_cls: type | None) -> None:
+    global _moe_layer_predicate
+    if base_cls is not None:
+
+        def _isinstance_moe(m: nn.Module) -> bool:
+            return isinstance(m, base_cls)
+
+        _moe_layer_predicate = _isinstance_moe
+    else:
+        _moe_layer_predicate = _duck_type_moe_layer
 
 
 def _slice_layout_hint(repo_root: Path) -> str:
@@ -72,25 +94,82 @@ def _resolve_slice_stack() -> tuple[type, type, type]:
         from base import BaseMoEArchitecture, ModelConverter
         from schemas import TrainingConfig
 
+        _set_moe_layer_predicate(BaseMoEArchitecture)
         return BaseMoEArchitecture, ModelConverter, TrainingConfig
 
     if ec.is_dir():
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        for sub in ("architectures", "initialization", "losses"):
-            with suppress(ImportError):
-                importlib.import_module(f"src.expert_construction.{sub}")
-        try:
-            from src.expert_construction.base import BaseMoEArchitecture, ModelConverter
-        except ImportError:
-            from src.expert_construction.base import BaseMoEArchitecture
-            from src.expert_construction.model_converter import ModelConverter
-
-        from src.expert_construction.schemas import TrainingConfig
-
-        return BaseMoEArchitecture, ModelConverter, TrainingConfig
+        return _resolve_expert_construction_stack(root)
 
     raise ModuleNotFoundError(_slice_layout_hint(root))
+
+
+def _resolve_expert_construction_stack(
+    root: Path,
+) -> tuple[type | None, type, type]:
+    """
+    Slim ``src/expert_construction`` checkouts often omit ``base.py``; load symbols from
+    wherever the fork places them and fall back to duck typing for MoE layer discovery.
+    """
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    for sub in ("architectures", "initialization", "losses"):
+        with suppress(ImportError):
+            importlib.import_module(f"src.expert_construction.{sub}")
+
+    model_converter_mod = None
+    ModelConverter = None
+    for dotted in (
+        "src.expert_construction.model_converter",
+        "src.expert_construction.model_conversion",
+        "src.expert_construction.converter",
+    ):
+        with suppress(ImportError):
+            mc = importlib.import_module(dotted)
+            cand = getattr(mc, "ModelConverter", None)
+            if cand is not None:
+                ModelConverter = cand
+                model_converter_mod = mc
+                break
+    if ModelConverter is None:
+        raise ModuleNotFoundError(
+            "Could not import ModelConverter from src.expert_construction "
+            "(tried model_converter, model_conversion, converter)."
+        )
+
+    BaseMoEArchitecture: type | None = getattr(
+        model_converter_mod, "BaseMoEArchitecture", None
+    )
+    if BaseMoEArchitecture is None:
+        for dotted in (
+            "src.expert_construction.base",
+            "src.expert_construction.moe_base",
+            "src.expert_construction.core.base",
+        ):
+            with suppress(ImportError, AttributeError):
+                mod = importlib.import_module(dotted)
+                BaseMoEArchitecture = getattr(mod, "BaseMoEArchitecture", None)
+                if BaseMoEArchitecture is not None:
+                    break
+
+    TrainingConfig = None
+    for dotted in (
+        "src.expert_construction.schemas",
+        "src.expert_construction.config",
+        "src.expert_construction.training_config",
+    ):
+        with suppress(ImportError, AttributeError):
+            mod = importlib.import_module(dotted)
+            TrainingConfig = getattr(mod, "TrainingConfig", None)
+            if TrainingConfig is not None:
+                break
+    if TrainingConfig is None:
+        raise ModuleNotFoundError(
+            "Could not import TrainingConfig from src.expert_construction "
+            "(tried schemas, config, training_config)."
+        )
+
+    _set_moe_layer_predicate(BaseMoEArchitecture)
+    return BaseMoEArchitecture, ModelConverter, TrainingConfig
 
 
 BaseMoEArchitecture, ModelConverter, TrainingConfig = _resolve_slice_stack()
@@ -115,7 +194,7 @@ def collect_moe_layers(model: torch.nn.Module) -> list[torch.nn.Module]:
     """
     named: list[tuple[str, torch.nn.Module]] = []
     for name, mod in model.named_modules():
-        if isinstance(mod, BaseMoEArchitecture):
+        if _moe_layer_predicate(mod):
             named.append((name, mod))
     named.sort(key=lambda x: x[0])
     return [m for _, m in named]

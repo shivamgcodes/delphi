@@ -1,7 +1,6 @@
 import json
-import os
-import sys
 from pathlib import Path
+from typing import Any
 
 import torch
 from jaxtyping import Int
@@ -12,18 +11,6 @@ from transformers import PreTrainedModel
 from delphi import logger
 from delphi.config import CacheConfig
 from delphi.latents.cache import InMemoryCache
-
-# Slice repo root must be on path for ``from src.expert_construction...``.
-_env = os.environ.get("DELPHI_SLICE_ROOT") or os.environ.get("SLICE_REPO")
-slice_path = (
-    Path(_env).expanduser().resolve()
-    if _env
-    else Path(__file__).parent.parent.parent.parent / "slice"
-)
-if str(slice_path) not in sys.path:
-    sys.path.insert(0, str(slice_path))
-
-from src.expert_construction.model_converter import ModelWrapper
 
 token_tensor_type = Int[Tensor, "batch sequence"]
 
@@ -37,7 +24,7 @@ class MoELatentCache:
     def __init__(
         self,
         model: PreTrainedModel,
-        wrapper: ModelWrapper,
+        wrapper: Any,
         batch_size: int,
         top_k_only: bool = True,
         log_path: Path | None = None,
@@ -47,7 +34,7 @@ class MoELatentCache:
 
         Args:
             model: The model with MoE wrapper attached.
-            wrapper: The ModelWrapper containing MoE layers.
+            wrapper: Slice ``ModelWrapper`` (``moe_layers`` with ``_router_probs``, ``k``).
             batch_size: Size of batches for processing.
             top_k_only: Whether to sparsify by keeping only top-k router probs.
             log_path: Path to save logging output.
