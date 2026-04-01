@@ -31,15 +31,43 @@ def _slice_repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent.parent / "slice"
 
 
-_SLICE_SRC = _slice_repo_root() / "src"
-if not _SLICE_SRC.is_dir():
-    raise ModuleNotFoundError(
-        f"SLICE checkout not found: expected directory {_SLICE_SRC!s} "
-        "(clone the slice repo so it contains src/architectures, or set "
-        "DELPHI_SLICE_ROOT to the slice repo root)."
+def _slice_import_bases(repo_root: Path) -> list[Path]:
+    """
+    Directories that must be on ``sys.path`` so ``import architectures`` resolves.
+
+    Standard layout is ``<repo>/src/architectures``; some checkouts expose packages
+    directly under the repo root instead.
+    """
+    repo_root = repo_root.resolve()
+    if not repo_root.is_dir():
+        return []
+    bases: list[Path] = []
+    for base in (repo_root / "src", repo_root):
+        arch = base / "architectures"
+        if base.is_dir() and arch.is_dir():
+            bases.append(base)
+    return bases
+
+
+_SLICE_REPO_ROOT = _slice_repo_root()
+_SLICE_IMPORT_BASES = _slice_import_bases(_SLICE_REPO_ROOT)
+if not _SLICE_IMPORT_BASES:
+    hint = (
+        f"Set DELPHI_SLICE_ROOT to the MoE slice repo root (folder containing "
+        f"src/architectures). Tried {_SLICE_REPO_ROOT!s}."
     )
-if str(_SLICE_SRC) not in sys.path:
-    sys.path.insert(0, str(_SLICE_SRC))
+    if _SLICE_REPO_ROOT.is_dir():
+        top = sorted(p.name for p in _SLICE_REPO_ROOT.iterdir())[:40]
+        hint += f" Contents: {top!r}."
+        src = _SLICE_REPO_ROOT / "src"
+        if src.is_dir():
+            hint += f" src/: {sorted(p.name for p in src.iterdir())[:40]!r}."
+    raise ModuleNotFoundError(hint)
+
+for _p in reversed(_SLICE_IMPORT_BASES):
+    s = str(_p)
+    if s not in sys.path:
+        sys.path.insert(0, s)
 
 import architectures  # noqa: F401, E402 — register MoE architectures
 import initialization  # noqa: F401, E402
