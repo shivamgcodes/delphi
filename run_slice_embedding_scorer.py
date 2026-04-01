@@ -80,7 +80,7 @@ def cache_slice_activations(
     batch_size: int = 32,
     ctx_len: int = 256,
     dataset_repo: str = "EleutherAI/SmolLM2-135M-10B",
-    dataset_split: str = "train[:1%]",
+    dataset_split: str = "train[:10000]",
     data_source: str = "generic",
     mmlu_subjects: str = "all",
     mmlu_split: str = "test",
@@ -89,6 +89,7 @@ def cache_slice_activations(
     top_k_cap: int | None = None,
     model_name_for_config: str = "",
     slice_extra: dict | None = None,
+    datasets_cache_dir: str | None = None,
 ):
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -130,6 +131,7 @@ def cache_slice_activations(
             cache_cfg.dataset_name,
             cache_cfg.dataset_column,
             seed=42,
+            datasets_cache_dir=datasets_cache_dir,
         )
 
     if filter_bos:
@@ -378,11 +380,24 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--ctx_len", type=int, default=256)
     parser.add_argument(
+        "--hf_datasets_cache",
+        type=str,
+        default=None,
+        help="Directory for Hugging Face ``datasets`` downloads (can be tens of GB for "
+        "large corpora). Default: env / platform cache. Example: /workspace/hf_datasets_cache",
+    )
+    parser.add_argument(
         "--dataset_repo",
         type=str,
         default="EleutherAI/SmolLM2-135M-10B",
     )
-    parser.add_argument("--dataset_split", type=str, default="train[:1%]")
+    parser.add_argument(
+        "--dataset_split",
+        type=str,
+        default="train[:10000]",
+        help="HF split slice. Default caps rows to limit parquet downloads (disk). "
+        "Use e.g. train[:1%%] for more data if you have space.",
+    )
     parser.add_argument(
         "--data_source",
         type=str,
@@ -417,6 +432,12 @@ def main():
 
     args = parser.parse_args()
     routing_mode: RoutingMode = args.routing_mode  # type: ignore[assignment]
+
+    datasets_cache_dir = (
+        str(Path(args.hf_datasets_cache).expanduser().resolve())
+        if args.hf_datasets_cache
+        else None
+    )
 
     hf_token = args.hf_token if args.hf_token else os.environ.get("HF_TOKEN")
     if hf_token is not None and hf_token == "":
@@ -479,6 +500,7 @@ def main():
             top_k_cap=args.top_k_cap,
             model_name_for_config=model_name_label,
             slice_extra=slice_extra,
+            datasets_cache_dir=datasets_cache_dir,
         )
         del model, moe_layers
         torch.cuda.empty_cache()

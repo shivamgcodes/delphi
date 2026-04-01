@@ -15,6 +15,8 @@ def load_tokenized_data(
     column_name: str = "text",
     seed: int = 22,
     convert_to_tensor_chunk_size: int = 2**18,
+    *,
+    datasets_cache_dir: str | None = None,
 ):
     """
     Load a huggingface dataset, tokenize it, and shuffle.
@@ -31,11 +33,18 @@ def load_tokenized_data(
         convert_to_tensor_chunk_size: The chunk size to use when converting the dataset
         from Huggingface's Table format to a tensor. Values around 2**17-2**18 seem to
         be the fastest.
+        datasets_cache_dir: Optional Hugging Face ``datasets`` cache directory (large
+        downloads). If ``None``, uses the default cache (often under ``HF_HOME``).
     """
     from datasets import load_dataset
     from sparsify.data import chunk_and_tokenize
 
-    data = load_dataset(dataset_repo, name=dataset_name, split=dataset_split)
+    load_kw: dict = {}
+    if datasets_cache_dir:
+        load_kw["cache_dir"] = datasets_cache_dir
+    data = load_dataset(
+        dataset_repo, name=dataset_name, split=dataset_split, **load_kw
+    )
     data = data.shuffle(seed)
     tokens_ds = chunk_and_tokenize(
         data,  # type: ignore
