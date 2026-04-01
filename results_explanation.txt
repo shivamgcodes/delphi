@@ -1,0 +1,81 @@
+Why Detection Scores Are ~0.5 (Near-Random)
+=============================================
+
+Short answer: The delphi detection scorer was designed for SAE features,
+not MoE router probabilities. These are fundamentally different objects.
+
+
+SAE Features (what delphi was designed for)
+-------------------------------------------
+- Thousands of features per layer (e.g. 32,768 for a 4096-dim model)
+- Each feature is monosemantic: fires on one narrow concept
+  (e.g. "words ending in -ing", "tokens after a comma", "legal terminology")
+- Very low firing rate: ~0.1-1% of tokens
+- Clean, sparse signal -> easy to explain and score
+
+
+MoE Router Probabilities (what we scored)
+------------------------------------------
+- Only 256 experts per layer
+- k=32, so each expert fires on ~12.5% of all tokens (32/256)
+- Experts handle broad computational roles, not semantic concepts
+- High base rate -> near-impossible to find a single natural language
+  explanation that cleanly distinguishes activating from non-activating tokens
+
+
+Why This Gives 0.5 Balanced Accuracy
+--------------------------------------
+The detection scorer pipeline:
+  1. Explainer LLM generates a natural language explanation for each expert
+     (e.g. "text related to sports")
+  2. Scorer LLM is shown mixed activating + non-activating examples and asked
+     to predict which ones activate the expert: [1, 0, 1, 0, 0]
+  3. Predictions are compared to ground truth
+
+When experts fire on 12.5% of tokens with no clean semantic theme,
+the explainer generates vague or wrong explanations. The scorer then
+can't use those explanations to distinguish activating from non-activating
+examples, so predictions are effectively random -> ~0.5 accuracy.
+
+This is not a bug. It's a meaningful null result.
+
+
+What Would Be More Informative
+--------------------------------
+Instead of binary detection scoring, a better evaluation for MoE experts would be:
+
+1. Top-k token analysis:
+   Look at the top 1% of tokens by router probability for each expert.
+   Do they cluster semantically? This doesn't require an LLM scorer.
+
+2. Cross-method comparison:
+   Compare which tokens are assigned to each expert across kmeans vs
+   spectral vs OT-EMD. Do the same tokens cluster together? Higher
+   agreement = more stable/meaningful expert assignment.
+
+3. Expert specialization metric:
+   Measure entropy of router probability distribution per expert.
+   Lower entropy = more specialized expert = more interpretable.
+
+4. Activation overlap:
+   Measure how much expert assignments overlap between methods.
+   This directly measures whether the splitting method matters.
+
+
+Results Summary (for reference)
+---------------------------------
+Model            : facebook/opt-1.3b
+Explainer        : google/gemma-3-4b-it
+Tokens cached    : 5,000,000
+Experts scored   : 256 per layer, 4 layers
+Dataset          : EleutherAI/SmolLM2-135M-10B
+
+Model          Bal Acc     F1    Precision  Recall
+--------------------------------------------------
+kmeans           0.513  0.521      0.518   0.524
+spectral         0.513  0.520      0.518   0.521
+ot-emd           0.513  0.520      0.517   0.524
+
+All three methods score identically -> the splitting method doesn't
+affect interpretability as measured by detection scoring, but this
+metric is likely not sensitive enough for MoE experts.

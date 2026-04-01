@@ -1,0 +1,28 @@
+Detection Scoring Results - MoE Expert Interpretability
+======================================================================
+Model            : facebook/opt-1.3b
+Explainer        : google/gemma-3-4b-it
+Tokens cached    : 5,000,000
+Experts scored   : 256
+Dataset          : EleutherAI/SmolLM2-135M-10B (train[:10000])
+
+Model                 Bal Acc       F1  Precision   Recall    Total
+----------------------------------------------------------------------
+kmeans-full             0.5130   0.5210     0.5180   0.5240   101300
+spectral-full           0.5130   0.5200     0.5180   0.5210   101200
+ot-emd-full             0.5130   0.5200     0.5170   0.5240   101450
+
+Confusion Matrices
+----------------------------------------------------------------------
+
+kmeans-full:
+  TP=  26782  FP=  24957
+  FN=  24368  TN=  25193
+
+spectral-full:
+  TP=  26658  FP=  24764
+  FN=  24542  TN=  25236
+
+ot-emd-full:
+  TP=  26800  FP=  25079
+  FN=  24350  TN=  25221
