@@ -1,12 +1,20 @@
 """
 Load SLICE / ModelConverter MoE checkpoints (e.g. DeepSpeed ZeRO under .../pytorch_model).
 
-Expects the `slice` repo as a sibling of the delphi repo: ``SPAR/slice``.
+SLICE Python modules live under the repo's ``src/`` directory (``architectures``, ``base``, …).
+
+Resolution order for the slice **repo root** (the folder that contains ``src/``):
+
+1. Environment variable ``DELPHI_SLICE_ROOT`` or ``SLICE_REPO`` (absolute path on disk).
+2. Otherwise ``<parent-of-delphi-repo>/slice`` (sibling checkout, e.g. ``SPAR/slice``).
+
+On RunPod/Docker, clone slice and set e.g. ``export DELPHI_SLICE_ROOT=/workspace/slice``.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -15,10 +23,23 @@ from urllib.request import urlopen
 import torch
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
-# slice repo root (sibling of delphi checkout)
-_SLICE_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "slice"
-if str(_SLICE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SLICE_ROOT))
+
+def _slice_repo_root() -> Path:
+    env = os.environ.get("DELPHI_SLICE_ROOT") or os.environ.get("SLICE_REPO")
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path(__file__).resolve().parent.parent.parent.parent / "slice"
+
+
+_SLICE_SRC = _slice_repo_root() / "src"
+if not _SLICE_SRC.is_dir():
+    raise ModuleNotFoundError(
+        f"SLICE checkout not found: expected directory {_SLICE_SRC!s} "
+        "(clone the slice repo so it contains src/architectures, or set "
+        "DELPHI_SLICE_ROOT to the slice repo root)."
+    )
+if str(_SLICE_SRC) not in sys.path:
+    sys.path.insert(0, str(_SLICE_SRC))
 
 import architectures  # noqa: F401, E402 — register MoE architectures
 import initialization  # noqa: F401, E402

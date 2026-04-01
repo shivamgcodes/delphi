@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -12,9 +13,13 @@ from delphi import logger
 from delphi.config import CacheConfig
 from delphi.latents.cache import InMemoryCache
 
-# Make slice package accessible (slice is at SPAR/slice, not SPAR/delphi/slice)
-# slice uses "from src.expert_construction..." so we need /workspace/slice in path
-slice_path = Path(__file__).parent.parent.parent.parent / "slice"
+# Slice repo root must be on path for ``from src.expert_construction...``.
+_env = os.environ.get("DELPHI_SLICE_ROOT") or os.environ.get("SLICE_REPO")
+slice_path = (
+    Path(_env).expanduser().resolve()
+    if _env
+    else Path(__file__).parent.parent.parent.parent / "slice"
+)
 if str(slice_path) not in sys.path:
     sys.path.insert(0, str(slice_path))
 

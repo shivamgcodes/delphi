@@ -6,6 +6,9 @@ Loads training config + DeepSpeed ZeRO weights under ``checkpoint_final/pytorch_
 caches `_last_routing_probs` in two modes, then reuses the same pipeline as
 ``run_moe_embedding_scorer.py``.
 
+Requires the **slice** repo (with ``src/architectures``, etc.). Set ``DELPHI_SLICE_ROOT``
+to its root if it is not a sibling folder named ``slice`` next to the delphi repo.
+
 Example (auto-download ``config.json`` + ``pytorch_model`` from the Hub if missing):
 
     python run_slice_embedding_scorer.py \\
@@ -18,6 +21,15 @@ Override paths or use a config URL:
     python run_slice_embedding_scorer.py \\
         --config https://huggingface.co/.../config.json \\
         --hf_cache_dir ~/.cache/delphi/slice_hf
+
+MMLU tokens (like slice's lm_eval ``mmlu_*_continuation`` style prompts):
+
+    python run_slice_embedding_scorer.py \\
+        --data_source mmlu \\
+        --mmlu_subjects abstract_algebra,anatomy \\
+        --mmlu_split test \\
+        --routing_mode expert_probs \\
+        --output_path results/slice_mmlu
 """
 
 from __future__ import annotations
@@ -47,6 +59,7 @@ from delphi.pipeline import Pipeline, process_wrapper
 from delphi.scorers import DetectionScorer, EmbeddingScorer
 from delphi.clients import Offline
 from delphi.utils import load_tokenized_data
+from delphi.latents.mmlu_tokens import MMLU_REPO, load_mmlu_tokenized_data
 
 
 def cache_slice_activations(
@@ -60,6 +73,9 @@ def cache_slice_activations(
     ctx_len: int = 256,
     dataset_repo: str = "EleutherAI/SmolLM2-135M-10B",
     dataset_split: str = "train[:1%]",
+    data_source: str = "generic",
+    mmlu_subjects: str = "all",
+    mmlu_split: str = "test",
     filter_bos: bool = True,
     top_k_only: bool = True,
     top_k_cap: int | None = None,
@@ -68,23 +84,45 @@ def cache_slice_activations(
 ):
     output_path.mkdir(parents=True, exist_ok=True)
 
-    cache_cfg = CacheConfig(
-        dataset_repo=dataset_repo,
-        dataset_split=dataset_split,
-        cache_ctx_len=ctx_len,
-        batch_size=batch_size,
-        n_tokens=n_tokens,
-    )
-
-    tokens = load_tokenized_data(
-        cache_cfg.cache_ctx_len,
-        tokenizer,
-        cache_cfg.dataset_repo,
-        cache_cfg.dataset_split,
-        cache_cfg.dataset_name,
-        cache_cfg.dataset_column,
-        seed=42,
-    )
+    merged_extra = dict(slice_extra or {})
+    if data_source == "mmlu":
+        merged_extra["cache_data_source"] = "mmlu"
+        merged_extra["mmlu_subjects"] = mmlu_subjects
+        merged_extra["mmlu_split"] = mmlu_split
+        cache_cfg = CacheConfig(
+            dataset_repo=MMLU_REPO,
+            dataset_split=f"{mmlu_split}:{mmlu_subjects}",
+            cache_ctx_len=ctx_len,
+            batch_size=batch_size,
+            n_tokens=n_tokens,
+        )
+        print(
+            f"Loading MMLU tokens (subjects={mmlu_subjects!r}, split={mmlu_split!r}) …"
+        )
+        tokens = load_mmlu_tokenized_data(
+            cache_cfg.cache_ctx_len,
+            tokenizer,
+            subjects=mmlu_subjects,
+            split=mmlu_split,
+            seed=42,
+        )
+    else:
+        cache_cfg = CacheConfig(
+            dataset_repo=dataset_repo,
+            dataset_split=dataset_split,
+            cache_ctx_len=ctx_len,
+            batch_size=batch_size,
+            n_tokens=n_tokens,
+        )
+        tokens = load_tokenized_data(
+            cache_cfg.cache_ctx_len,
+            tokenizer,
+            cache_cfg.dataset_repo,
+            cache_cfg.dataset_split,
+            cache_cfg.dataset_name,
+            cache_cfg.dataset_column,
+            seed=42,
+        )
 
     if filter_bos:
         if tokenizer.bos_token_id is not None:
@@ -113,7 +151,7 @@ def cache_slice_activations(
         cfg=cache_cfg,
         model_name=model_name_for_config or "slice_moe",
         routing_mode=routing_mode,
-        slice_extra=slice_extra,
+        slice_extra=merged_extra,
     )
 
     print(f"Cached activations saved to {output_path}")
@@ -338,6 +376,26 @@ def main():
     )
     parser.add_argument("--dataset_split", type=str, default="train[:1%]")
     parser.add_argument(
+        "--data_source",
+        type=str,
+        choices=["generic", "mmlu"],
+        default="generic",
+        help="generic: text dataset via --dataset_repo. "
+        "mmlu: cais/mmlu with continuation-style prompts (cf. slice lm_eval mmlu_*_continuation).",
+    )
+    parser.add_argument(
+        "--mmlu_subjects",
+        type=str,
+        default="all",
+        help="Comma-separated cais/mmlu subject configs, or 'all' for all 57.",
+    )
+    parser.add_argument(
+        "--mmlu_split",
+        type=str,
+        default="test",
+        help="MMLU split passed to load_dataset (e.g. test, validation, dev).",
+    )
+    parser.add_argument(
         "--no_top_k_sparsify",
         action="store_true",
         help="Store full routing vectors (can be very large for segment_expert)",
@@ -401,6 +459,9 @@ def main():
             ctx_len=args.ctx_len,
             dataset_repo=args.dataset_repo,
             dataset_split=args.dataset_split,
+            data_source=args.data_source,
+            mmlu_subjects=args.mmlu_subjects,
+            mmlu_split=args.mmlu_split,
             top_k_only=not args.no_top_k_sparsify,
             top_k_cap=args.top_k_cap,
             model_name_for_config=model_name_label,
