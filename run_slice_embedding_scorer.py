@@ -63,6 +63,13 @@ from delphi.utils import load_tokenized_data
 from delphi.latents.mmlu_tokens import MMLU_REPO, load_mmlu_tokenized_data
 
 
+def _latent_hookpoint_dirs(latents_path: Path) -> list[str]:
+    """Return sorted cache module names (subdirs, e.g. ``moe_layer_0``)."""
+    if not latents_path.is_dir():
+        return []
+    return sorted(p.name for p in latents_path.iterdir() if p.is_dir())
+
+
 def cache_slice_activations(
     model,
     moe_layers: list,
@@ -440,7 +447,12 @@ def main():
 
     model_name_label = training_config.model_name
 
-    if not args.skip_cache and not latents_path.exists():
+    hookpoints_existing = _latent_hookpoint_dirs(latents_path)
+    # Treat an empty or missing latents dir as "no cache" so we do not skip forward pass
+    # just because ``latents/`` was created (e.g. by a failed run).
+    need_slice_cache = not args.skip_cache and not hookpoints_existing
+
+    if need_slice_cache:
         print("\n=== Caching SLICE router activations ===")
         model, moe_layers, train_cfg = load_slice_model(training_config, weights_path)
         m_seg = train_cfg.moe.num_segments
@@ -473,9 +485,14 @@ def main():
     else:
         print(f"Using existing cache at {latents_path} (--skip_cache or cache exists)")
 
-    hookpoints = sorted([d.name for d in latents_path.iterdir() if d.is_dir()])
+    hookpoints = _latent_hookpoint_dirs(latents_path)
     if not hookpoints:
-        raise RuntimeError(f"No module subdirs under {latents_path}")
+        raise RuntimeError(
+            f"No module subdirs (e.g. moe_layer_0) under {latents_path}. "
+            "Delete or fix that folder, then re-run without --skip_cache so the SLICE forward "
+            "cache is written, or pass --latents_path to a directory that already contains "
+            "moe_layer_* subfolders."
+        )
 
     def read_latent_width() -> int:
         cfg_json = latents_path / hookpoints[0] / "config.json"
