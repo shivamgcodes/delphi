@@ -67,7 +67,6 @@ def ensure_slice_hf_checkpoint(
             repo_id=repo_id,
             local_dir=str(cache_dir),
             allow_patterns=allow_patterns,
-            local_dir_use_symlinks=False,
             token=token,
             revision=revision,
         )

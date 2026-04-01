@@ -177,6 +177,39 @@ BaseMoEArchitecture, ModelConverter, TrainingConfig = _resolve_slice_stack()
 from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 
 
+def _deepspeed_zero_tag(weights_dir: Path) -> str | None:
+    """
+    DeepSpeed's merge helper expects either a ``latest`` file (naming a tag subdirectory) or an
+    explicit ``tag``. Hub uploads often omit ``latest`` and place ``*_optim_states.pt`` directly
+    under ``pytorch_model/``; in that case ``tag`` must be ``""`` so the checkpoint dir is the
+    shard directory itself (``os.path.join(dir, "") == dir``).
+    """
+    weights_dir = weights_dir.resolve()
+    if (weights_dir / "latest").is_file():
+        return None
+    if any(weights_dir.glob("*_optim_states.pt")):
+        return ""
+    candidates = [
+        p.name
+        for p in weights_dir.iterdir()
+        if p.is_dir() and any(p.glob("*_optim_states.pt"))
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"Cannot load DeepSpeed ZeRO weights under {weights_dir}: no 'latest' file, no "
+            "*_optim_states.pt in this folder or in a single subfolder. ZeRO merge needs "
+            "optimizer state shards next to (or under) mp_rank_*_model_states.pt."
+        )
+
+    def _sort_key(name: str) -> tuple[int, int | str]:
+        if name.startswith("global_step") and name[len("global_step") :].isdigit():
+            return (0, int(name[len("global_step") :]))
+        return (1, name)
+
+    candidates.sort(key=_sort_key)
+    return candidates[-1]
+
+
 def load_training_config(config_path_or_url: str) -> TrainingConfig:
     """Load JSON training config from a local path or http(s) URL."""
     if urlparse(config_path_or_url).scheme in ("http", "https"):
@@ -242,7 +275,13 @@ def load_slice_model(
     model = ModelConverter.convert_to_moe(model, training_config)
 
     print(f"Loading ZeRO checkpoint from {weights_path}")
-    model = load_state_dict_from_zero_checkpoint(model, str(weights_path))
+    z_tag = _deepspeed_zero_tag(weights_path)
+    if z_tag is not None:
+        model = load_state_dict_from_zero_checkpoint(
+            model, str(weights_path), tag=z_tag
+        )
+    else:
+        model = load_state_dict_from_zero_checkpoint(model, str(weights_path))
 
     model.to(device_t)
     model.eval()
