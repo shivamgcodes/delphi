@@ -1,7 +1,12 @@
 """
 Load SLICE / ModelConverter MoE checkpoints (e.g. DeepSpeed ZeRO under .../pytorch_model).
 
-SLICE Python modules live under the repo's ``src/`` directory (``architectures``, ``base``, …).
+Two slice repo layouts are supported:
+
+1. **Flat ``src/``** (original): ``src/architectures``, ``base.py``, ``schemas.py`` on ``sys.path``
+   via ``<repo>/src``.
+2. **Packaged ``src/expert_construction``** (refactor): repo root on ``sys.path``; imports use
+   ``from src.expert_construction…`` (same convention as ``run_moe_embedding_scorer.py``).
 
 Resolution order for the slice **repo root** (the folder that contains ``src/``):
 
@@ -13,9 +18,11 @@ On RunPod/Docker, clone slice and set e.g. ``export DELPHI_SLICE_ROOT=/workspace
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
+from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -31,50 +38,64 @@ def _slice_repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent.parent / "slice"
 
 
-def _slice_import_bases(repo_root: Path) -> list[Path]:
-    """
-    Directories that must be on ``sys.path`` so ``import architectures`` resolves.
-
-    Standard layout is ``<repo>/src/architectures``; some checkouts expose packages
-    directly under the repo root instead.
-    """
-    repo_root = repo_root.resolve()
-    if not repo_root.is_dir():
-        return []
-    bases: list[Path] = []
-    for base in (repo_root / "src", repo_root):
-        arch = base / "architectures"
-        if base.is_dir() and arch.is_dir():
-            bases.append(base)
-    return bases
-
-
-_SLICE_REPO_ROOT = _slice_repo_root()
-_SLICE_IMPORT_BASES = _slice_import_bases(_SLICE_REPO_ROOT)
-if not _SLICE_IMPORT_BASES:
-    hint = (
-        f"Set DELPHI_SLICE_ROOT to the MoE slice repo root (folder containing "
-        f"src/architectures). Tried {_SLICE_REPO_ROOT!s}."
+def _slice_layout_hint(repo_root: Path) -> str:
+    msg = (
+        f"Set DELPHI_SLICE_ROOT to the slice repo root. Expected either "
+        f"src/architectures (flat layout) or src/expert_construction/ (packaged layout). "
+        f"Tried {repo_root!s}."
     )
-    if _SLICE_REPO_ROOT.is_dir():
-        top = sorted(p.name for p in _SLICE_REPO_ROOT.iterdir())[:40]
-        hint += f" Contents: {top!r}."
-        src = _SLICE_REPO_ROOT / "src"
+    if repo_root.is_dir():
+        msg += f" Top-level: {sorted(p.name for p in repo_root.iterdir())[:40]!r}."
+        src = repo_root / "src"
         if src.is_dir():
-            hint += f" src/: {sorted(p.name for p in src.iterdir())[:40]!r}."
-    raise ModuleNotFoundError(hint)
+            msg += f" src/: {sorted(p.name for p in src.iterdir())[:40]!r}."
+    return msg
 
-for _p in reversed(_SLICE_IMPORT_BASES):
-    s = str(_p)
-    if s not in sys.path:
-        sys.path.insert(0, s)
 
-import architectures  # noqa: F401, E402 — register MoE architectures
-import initialization  # noqa: F401, E402
-import losses  # noqa: F401, E402
-from base import BaseMoEArchitecture, ModelConverter  # noqa: E402
-from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint  # noqa: E402
-from schemas import TrainingConfig  # noqa: E402
+def _resolve_slice_stack() -> tuple[type, type, type]:
+    """
+    Configure ``sys.path`` and import MoE stack symbols.
+
+    Returns:
+        ``(BaseMoEArchitecture, ModelConverter, TrainingConfig)``
+    """
+    root = _slice_repo_root().resolve()
+    src = root / "src"
+    ec = src / "expert_construction"
+
+    if src.is_dir() and (src / "architectures").is_dir():
+        if str(src) not in sys.path:
+            sys.path.insert(0, str(src))
+        import architectures  # noqa: F401 — register MoE modules
+        import initialization  # noqa: F401
+        import losses  # noqa: F401
+        from base import BaseMoEArchitecture, ModelConverter
+        from schemas import TrainingConfig
+
+        return BaseMoEArchitecture, ModelConverter, TrainingConfig
+
+    if ec.is_dir():
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        for sub in ("architectures", "initialization", "losses"):
+            with suppress(ImportError):
+                importlib.import_module(f"src.expert_construction.{sub}")
+        try:
+            from src.expert_construction.base import BaseMoEArchitecture, ModelConverter
+        except ImportError:
+            from src.expert_construction.base import BaseMoEArchitecture
+            from src.expert_construction.model_converter import ModelConverter
+
+        from src.expert_construction.schemas import TrainingConfig
+
+        return BaseMoEArchitecture, ModelConverter, TrainingConfig
+
+    raise ModuleNotFoundError(_slice_layout_hint(root))
+
+
+BaseMoEArchitecture, ModelConverter, TrainingConfig = _resolve_slice_stack()
+
+from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 
 
 def load_training_config(config_path_or_url: str) -> TrainingConfig:

@@ -6,8 +6,9 @@ Loads training config + DeepSpeed ZeRO weights under ``checkpoint_final/pytorch_
 caches `_last_routing_probs` in two modes, then reuses the same pipeline as
 ``run_moe_embedding_scorer.py``.
 
-Requires the **slice** repo (with ``src/architectures``, etc.). Set ``DELPHI_SLICE_ROOT``
-to its root if it is not a sibling folder named ``slice`` next to the delphi repo.
+Requires the **slice** repo: either flat ``src/architectures`` or packaged
+``src/expert_construction``. Set ``DELPHI_SLICE_ROOT`` to the repo root if it is not a
+sibling folder named ``slice`` next to the delphi repo.
 
 Example (auto-download ``config.json`` + ``pytorch_model`` from the Hub if missing):
 
