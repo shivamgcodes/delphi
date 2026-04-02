@@ -95,7 +95,8 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
 from delphi.config import CacheConfig, ConstructorConfig, SamplerConfig
-from delphi.explainers.explainer import ExplainerResult
+from delphi.explainers.default.default import DefaultExplainer
+from delphi.explainers.explainer import ExplainerResult, explanation_loader
 from delphi.latents import LatentDataset
 from delphi.latents.cache_slice import RoutingMode, SliceLatentCache
 from delphi.latents.slice_adapter import load_slice_model, load_training_config
@@ -104,7 +105,7 @@ from delphi.latents.slice_hf_download import (
     DEFAULT_HF_REPO,
     resolve_config_and_weights,
 )
-from delphi.pipeline import Pipeline, process_wrapper
+from delphi.pipeline import Pipe, Pipeline, process_wrapper
 from delphi.scorers import DetectionScorer, EmbeddingScorer
 from delphi.clients import Offline
 from delphi.utils import load_tokenized_data
@@ -236,57 +237,26 @@ def cache_slice_activations(
     return [f"moe_layer_{i}" for i in range(len(moe_layers))]
 
 
-def run_embedding_scorer(
+def _build_dataset(
     latents_path: Path,
-    output_path: Path,
     tokenizer,
     hookpoints: list[str],
-    latent_range: torch.Tensor | None = None,
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-):
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    print(f"Loading embedding model: {embedding_model}")
-    emb_model = SentenceTransformer(embedding_model)
-
-    if latent_range is not None:
-        latent_dict = {hook: latent_range for hook in hookpoints}
-    else:
-        latent_dict = None
-
-    sampler_cfg = SamplerConfig()
-    constructor_cfg = ConstructorConfig(non_activating_source="random")
-
-    dataset = LatentDataset(
+    latent_range: torch.Tensor | None,
+    n_non_activating: int = 50,
+) -> LatentDataset:
+    latent_dict = {hook: latent_range for hook in hookpoints} if latent_range is not None else None
+    return LatentDataset(
         raw_dir=latents_path,
-        sampler_cfg=sampler_cfg,
-        constructor_cfg=constructor_cfg,
+        sampler_cfg=SamplerConfig(),
+        constructor_cfg=ConstructorConfig(n_non_activating=n_non_activating),
         modules=hookpoints,
         latents=latent_dict,
         tokenizer=tokenizer,
     )
 
-    scorer = EmbeddingScorer(model=emb_model, verbose=True)
 
-    def scorer_postprocess(result, score_dir: Path):
-        safe_latent_name = str(result.record.latent).replace("/", "--")
-        with open(score_dir / f"{safe_latent_name}.txt", "wb") as f:
-            f.write(orjson.dumps(result.score))
-
-    scorer_pipe = process_wrapper(
-        scorer,
-        postprocess=partial(scorer_postprocess, score_dir=output_path),
-    )
-
-    print("Running embedding scorer pipeline...")
-    pipeline = Pipeline(dataset, scorer_pipe)
-    asyncio.run(pipeline.run(max_concurrent=4))
-
-    print(f"Scores saved to {output_path}")
-
-
-def _detection_scorer_preprocess(result):
-    """``LatentDataset`` yields ``LatentRecord``; full Delphi pipeline uses ``ExplainerResult``."""
+def _scorer_preprocess(result):
+    """Extract ``LatentRecord`` from ``ExplainerResult`` (or pass through if bare record)."""
     if isinstance(result, list):
         result = result[0]
     if isinstance(result, ExplainerResult):
@@ -297,49 +267,66 @@ def _detection_scorer_preprocess(result):
     return result
 
 
-def run_detection_scorer(
+def run_explainer(
+    latents_path: Path,
+    explanations_path: Path,
+    tokenizer,
+    hookpoints: list[str],
+    client: Offline,
+    latent_range: torch.Tensor | None = None,
+    n_non_activating: int = 50,
+) -> None:
+    """
+    Run ``DefaultExplainer`` over all latents and save per-latent explanations to disk.
+
+    Explanations are saved as ``{explanations_path}/{latent}.txt`` (orjson-dumped strings)
+    so that subsequent scorer runs can reuse them via ``--skip_explainer``.
+    """
+    explanations_path.mkdir(parents=True, exist_ok=True)
+    dataset = _build_dataset(latents_path, tokenizer, hookpoints, latent_range, n_non_activating)
+    explainer = DefaultExplainer(client, threshold=0.3, verbose=True)
+
+    def explainer_postprocess(result: ExplainerResult) -> ExplainerResult:
+        path = explanations_path / f"{result.record.latent}.txt"
+        path.write_bytes(orjson.dumps(result.explanation))
+        return result
+
+    explainer_pipe = Pipe(process_wrapper(explainer, postprocess=explainer_postprocess))
+    print("Running explainer pipeline…")
+    pipeline = Pipeline(dataset, explainer_pipe)
+    asyncio.run(pipeline.run(max_concurrent=1))
+    print(f"Explanations saved to {explanations_path}")
+
+
+def _make_explanation_pipe(explanations_path: Path) -> Pipe:
+    """
+    Return a ``Pipe`` that loads a saved explanation from disk for each ``LatentRecord``.
+    Used when ``--skip_explainer`` is set.
+    """
+    expl_dir = str(explanations_path)
+
+    async def _load(record):
+        return await explanation_loader(record, expl_dir)
+
+    return Pipe(_load)
+
+
+def run_embedding_scorer(
     latents_path: Path,
     output_path: Path,
     tokenizer,
     hookpoints: list[str],
+    explainer_pipe: Pipe,
     latent_range: torch.Tensor | None = None,
-    explainer_model: str = "meta-llama/Meta-Llama-3.1-8B-Instruct",
-    num_gpus: int = 1,
-    max_memory: float = 0.7,
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     n_non_activating: int = 50,
-):
+) -> None:
     output_path.mkdir(parents=True, exist_ok=True)
+    dataset = _build_dataset(latents_path, tokenizer, hookpoints, latent_range, n_non_activating)
 
-    print(f"Loading explainer model: {explainer_model}")
-    client = Offline(
-        explainer_model,
-        max_memory=max_memory,
-        max_model_len=4096,
-        num_gpus=num_gpus,
-    )
-
-    if latent_range is not None:
-        latent_dict = {hook: latent_range for hook in hookpoints}
-    else:
-        latent_dict = None
-
-    sampler_cfg = SamplerConfig()
-    constructor_cfg = ConstructorConfig(n_non_activating=n_non_activating)
-
-    dataset = LatentDataset(
-        raw_dir=latents_path,
-        sampler_cfg=sampler_cfg,
-        constructor_cfg=constructor_cfg,
-        modules=hookpoints,
-        latents=latent_dict,
-        tokenizer=tokenizer,
-    )
-
-    scorer = DetectionScorer(
-        client=client,
-        n_examples_shown=5,
-        verbose=True,
-    )
+    print(f"Loading embedding model: {embedding_model}")
+    emb_model = SentenceTransformer(embedding_model)
+    scorer = EmbeddingScorer(model=emb_model, verbose=True)
 
     def scorer_postprocess(result, score_dir: Path):
         safe_latent_name = str(result.record.latent).replace("/", "--")
@@ -348,14 +335,45 @@ def run_detection_scorer(
 
     scorer_pipe = process_wrapper(
         scorer,
-        preprocess=_detection_scorer_preprocess,
+        preprocess=_scorer_preprocess,
         postprocess=partial(scorer_postprocess, score_dir=output_path),
     )
 
-    print("Running detection scorer pipeline...")
-    pipeline = Pipeline(dataset, scorer_pipe)
-    asyncio.run(pipeline.run(max_concurrent=1))
+    print("Running embedding scorer pipeline…")
+    pipeline = Pipeline(dataset, explainer_pipe, scorer_pipe)
+    asyncio.run(pipeline.run(max_concurrent=4))
+    print(f"Scores saved to {output_path}")
 
+
+def run_detection_scorer(
+    latents_path: Path,
+    output_path: Path,
+    tokenizer,
+    hookpoints: list[str],
+    client: Offline,
+    explainer_pipe: Pipe,
+    latent_range: torch.Tensor | None = None,
+    n_non_activating: int = 50,
+) -> None:
+    output_path.mkdir(parents=True, exist_ok=True)
+    dataset = _build_dataset(latents_path, tokenizer, hookpoints, latent_range, n_non_activating)
+
+    scorer = DetectionScorer(client=client, n_examples_shown=5, verbose=True)
+
+    def scorer_postprocess(result, score_dir: Path):
+        safe_latent_name = str(result.record.latent).replace("/", "--")
+        with open(score_dir / f"{safe_latent_name}.txt", "wb") as f:
+            f.write(orjson.dumps(result.score))
+
+    scorer_pipe = process_wrapper(
+        scorer,
+        preprocess=_scorer_preprocess,
+        postprocess=partial(scorer_postprocess, score_dir=output_path),
+    )
+
+    print("Running detection scorer pipeline…")
+    pipeline = Pipeline(dataset, explainer_pipe, scorer_pipe)
+    asyncio.run(pipeline.run(max_concurrent=1))
     print(f"Scores saved to {output_path}")
 
 
@@ -451,6 +469,19 @@ def main():
         "--explainer_model",
         type=str,
         default="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        help="LLM used for both explanation generation and detection scoring.",
+    )
+    parser.add_argument(
+        "--num_gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs for the vLLM explainer/scorer client.",
+    )
+    parser.add_argument(
+        "--max_memory",
+        type=float,
+        default=0.7,
+        help="GPU memory fraction for the vLLM explainer/scorer client.",
     )
     parser.add_argument("--skip_cache", action="store_true")
     parser.add_argument(
@@ -525,6 +556,12 @@ def main():
         default=50,
         help="Number of non-activating (negative) examples to sample per latent for detection. "
         "Lower this if you see 'No available randomly sampled non-activating sequences' (e.g. use 5 or 10).",
+    )
+    parser.add_argument(
+        "--skip_explainer",
+        action="store_true",
+        help="Skip explanation generation and load saved explanations from "
+        "output_path/explanations/ instead. Requires a prior run without --skip_explainer.",
     )
 
     args = parser.parse_args()
@@ -644,27 +681,61 @@ def main():
         latent_range = None
 
     output_path = Path(args.output_path)
+    explanations_path = output_path / "explanations"
+
+    # --- Explainer stage ---
+    print("\n=== Explainer stage ===")
+    print(f"Loading explainer/scorer model: {args.explainer_model}")
+    llm_client = Offline(
+        args.explainer_model,
+        max_memory=args.max_memory,
+        max_model_len=4096,
+        num_gpus=args.num_gpus,
+    )
+
+    if args.skip_explainer:
+        if not explanations_path.is_dir() or not any(explanations_path.iterdir()):
+            raise RuntimeError(
+                f"--skip_explainer set but no explanations found under {explanations_path}. "
+                "Run once without --skip_explainer first."
+            )
+        print(f"Loading saved explanations from {explanations_path}")
+        explainer_pipe = _make_explanation_pipe(explanations_path)
+    else:
+        run_explainer(
+            latents_path=latents_path,
+            explanations_path=explanations_path,
+            tokenizer=tokenizer,
+            hookpoints=hookpoints,
+            client=llm_client,
+            latent_range=latent_range,
+            n_non_activating=args.n_non_activating,
+        )
+        explainer_pipe = _make_explanation_pipe(explanations_path)
 
     if args.scorer in ("embedding", "both"):
         print("\n=== Running Embedding Scorer ===")
         run_embedding_scorer(
-            latents_path,
-            output_path / "scores" / "embedding",
-            tokenizer,
-            hookpoints,
-            latent_range,
-            args.embedding_model,
+            latents_path=latents_path,
+            output_path=output_path / "scores" / "embedding",
+            tokenizer=tokenizer,
+            hookpoints=hookpoints,
+            explainer_pipe=explainer_pipe,
+            latent_range=latent_range,
+            embedding_model=args.embedding_model,
+            n_non_activating=args.n_non_activating,
         )
 
     if args.scorer in ("detection", "both"):
         print("\n=== Running Detection Scorer ===")
         run_detection_scorer(
-            latents_path,
-            output_path / "scores" / "detection",
-            tokenizer,
-            hookpoints,
-            latent_range,
-            args.explainer_model,
+            latents_path=latents_path,
+            output_path=output_path / "scores" / "detection",
+            tokenizer=tokenizer,
+            hookpoints=hookpoints,
+            client=llm_client,
+            explainer_pipe=explainer_pipe,
+            latent_range=latent_range,
             n_non_activating=args.n_non_activating,
         )
 
