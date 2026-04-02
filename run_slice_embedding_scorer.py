@@ -243,11 +243,12 @@ def _build_dataset(
     hookpoints: list[str],
     latent_range: torch.Tensor | None,
     n_non_activating: int = 50,
+    sampler_cfg: SamplerConfig | None = None,
 ) -> LatentDataset:
     latent_dict = {hook: latent_range for hook in hookpoints} if latent_range is not None else None
     return LatentDataset(
         raw_dir=latents_path,
-        sampler_cfg=SamplerConfig(),
+        sampler_cfg=sampler_cfg if sampler_cfg is not None else SamplerConfig(),
         constructor_cfg=ConstructorConfig(n_non_activating=n_non_activating),
         modules=hookpoints,
         latents=latent_dict,
@@ -275,6 +276,7 @@ def run_explainer(
     client: Offline,
     latent_range: torch.Tensor | None = None,
     n_non_activating: int = 50,
+    sampler_cfg: SamplerConfig | None = None,
 ) -> None:
     """
     Run ``DefaultExplainer`` over all latents and save per-latent explanations to disk.
@@ -283,7 +285,14 @@ def run_explainer(
     so that subsequent scorer runs can reuse them via ``--skip_explainer``.
     """
     explanations_path.mkdir(parents=True, exist_ok=True)
-    dataset = _build_dataset(latents_path, tokenizer, hookpoints, latent_range, n_non_activating)
+    dataset = _build_dataset(
+        latents_path,
+        tokenizer,
+        hookpoints,
+        latent_range,
+        n_non_activating,
+        sampler_cfg=sampler_cfg,
+    )
     explainer = DefaultExplainer(client, threshold=0.3, verbose=True)
 
     def explainer_postprocess(result: ExplainerResult) -> ExplainerResult:
@@ -482,6 +491,28 @@ def main():
         type=float,
         default=0.7,
         help="GPU memory fraction for the vLLM explainer/scorer client.",
+    )
+    parser.add_argument(
+        "--explainer_max_model_len",
+        type=int,
+        default=8192,
+        help="vLLM max_model_len for explainer and detection scorer. vLLM will not exceed "
+        "the model's configured max context (e.g. many Gemma 3 checkpoints are 4096); "
+        "if prompts still overflow, lower --explainer_n_examples_train.",
+    )
+    parser.add_argument(
+        "--explainer_n_examples_train",
+        type=int,
+        default=18,
+        help="Sampler n_examples_train for the explainer stage only (DefaultExplainer + "
+        "few-shot makes long prompts; default is reduced so 4k-context models can run). "
+        "Scorers still use the full SamplerConfig (40/50).",
+    )
+    parser.add_argument(
+        "--explainer_n_examples_test",
+        type=int,
+        default=20,
+        help="Sampler n_examples_test for the explainer stage only.",
     )
     parser.add_argument("--skip_cache", action="store_true")
     parser.add_argument(
@@ -689,7 +720,7 @@ def main():
     llm_client = Offline(
         args.explainer_model,
         max_memory=args.max_memory,
-        max_model_len=4096,
+        max_model_len=args.explainer_max_model_len,
         num_gpus=args.num_gpus,
     )
 
@@ -702,6 +733,10 @@ def main():
         print(f"Loading saved explanations from {explanations_path}")
         explainer_pipe = _make_explanation_pipe(explanations_path)
     else:
+        explainer_sampler = SamplerConfig(
+            n_examples_train=args.explainer_n_examples_train,
+            n_examples_test=args.explainer_n_examples_test,
+        )
         run_explainer(
             latents_path=latents_path,
             explanations_path=explanations_path,
@@ -710,6 +745,7 @@ def main():
             client=llm_client,
             latent_range=latent_range,
             n_non_activating=args.n_non_activating,
+            sampler_cfg=explainer_sampler,
         )
         explainer_pipe = _make_explanation_pipe(explanations_path)
 
