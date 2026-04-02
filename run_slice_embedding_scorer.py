@@ -306,6 +306,7 @@ def run_detection_scorer(
     explainer_model: str = "meta-llama/Meta-Llama-3.1-8B-Instruct",
     num_gpus: int = 1,
     max_memory: float = 0.7,
+    n_non_activating: int = 50,
 ):
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -323,7 +324,7 @@ def run_detection_scorer(
         latent_dict = None
 
     sampler_cfg = SamplerConfig()
-    constructor_cfg = ConstructorConfig()
+    constructor_cfg = ConstructorConfig(n_non_activating=n_non_activating)
 
     dataset = LatentDataset(
         raw_dir=latents_path,
@@ -518,6 +519,13 @@ def main():
         default=None,
         help="Cap top-k sparsification (per token, last dim)",
     )
+    parser.add_argument(
+        "--n_non_activating",
+        type=int,
+        default=50,
+        help="Number of non-activating (negative) examples to sample per latent for detection. "
+        "Lower this if you see 'No available randomly sampled non-activating sequences' (e.g. use 5 or 10).",
+    )
 
     args = parser.parse_args()
     routing_mode: RoutingMode = args.routing_mode  # type: ignore[assignment]
@@ -657,6 +665,7 @@ def main():
             hookpoints,
             latent_range,
             args.explainer_model,
+            n_non_activating=args.n_non_activating,
         )
 
     print("\n=== Done ===")
