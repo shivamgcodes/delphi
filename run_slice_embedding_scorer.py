@@ -281,6 +281,7 @@ def run_explainer(
     n_non_activating: int = 50,
     sampler_cfg: SamplerConfig | None = None,
     constructor_cfg: ConstructorConfig | None = None,
+    few_shot_pairs: int = 1,
 ) -> None:
     """
     Run ``DefaultExplainer`` over all latents and save per-latent explanations to disk.
@@ -298,7 +299,9 @@ def run_explainer(
         sampler_cfg=sampler_cfg,
         constructor_cfg=constructor_cfg,
     )
-    explainer = DefaultExplainer(client, threshold=0.3, verbose=True)
+    explainer = DefaultExplainer(
+        client, threshold=0.3, verbose=True, few_shot_pairs=few_shot_pairs
+    )
 
     def explainer_postprocess(result: ExplainerResult) -> ExplainerResult:
         path = explanations_path / f"{result.record.latent}.txt"
@@ -525,6 +528,15 @@ def main():
         default=16,
         help="Constructor example_ctx_len for the explainer stage only (shorter text per "
         "example). Must divide latent cache --ctx_len (default 256); try 8, 16, or 32.",
+    )
+    parser.add_argument(
+        "--explainer_few_shot_pairs",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="In-prompt few-shot user/assistant turns before your examples (each pair is "
+        "large with activations). Default 1 keeps prompts under common 4k vLLM caps; use 3 "
+        "for full Delphi behavior if context allows.",
     )
     parser.add_argument("--skip_cache", action="store_true")
     parser.add_argument(
@@ -773,6 +785,7 @@ def main():
             n_non_activating=args.n_non_activating,
             sampler_cfg=explainer_sampler,
             constructor_cfg=explainer_constructor,
+            few_shot_pairs=args.explainer_few_shot_pairs,
         )
         explainer_pipe = _make_explanation_pipe(explanations_path)
 

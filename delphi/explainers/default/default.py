@@ -11,6 +11,8 @@ class DefaultExplainer(Explainer):
     """Whether to show activations to the explainer."""
     cot: bool = False
     """Whether to use chain of thought reasoning."""
+    few_shot_pairs: int = 3
+    """Number of in-prompt few-shot user/assistant turns (1--3). Lower this to fit short LLM contexts."""
 
     def _build_prompt(self, examples: list[ActivatingExample]) -> list[dict]:
         highlighted_examples = []
@@ -37,6 +39,7 @@ class DefaultExplainer(Explainer):
             examples=highlighted_examples,
             activations=self.activations,
             cot=self.cot,
+            n_few_shot_pairs=self.few_shot_pairs,
         )
 
     def call_sync(self, record):
