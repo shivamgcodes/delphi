@@ -181,7 +181,7 @@ def run_embedding_scorer(
     # Run pipeline
     print("Running embedding scorer pipeline...")
     pipeline = Pipeline(dataset, scorer_pipe)
-    asyncio.run(pipeline.run(n_processes=4))
+    asyncio.run(pipeline.run(max_concurrent=4))
 
     print(f"Scores saved to {output_path}")
 
@@ -253,7 +253,7 @@ def run_detection_scorer(
     # Run pipeline
     print("Running detection scorer pipeline...")
     pipeline = Pipeline(dataset, scorer_pipe)
-    asyncio.run(pipeline.run(n_processes=1))
+    asyncio.run(pipeline.run(max_concurrent=1))
 
     print(f"Scores saved to {output_path}")
 
