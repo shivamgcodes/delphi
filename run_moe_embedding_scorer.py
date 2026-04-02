@@ -34,12 +34,25 @@ if str(slice_path) not in sys.path:
 from src.expert_construction.model_converter import ModelWrapper
 
 from delphi.config import CacheConfig, ConstructorConfig, SamplerConfig, RunConfig
+from delphi.explainers.explainer import ExplainerResult
 from delphi.latents import LatentDataset
 from delphi.latents.cache_moe import MoELatentCache
 from delphi.pipeline import Pipeline, process_wrapper
 from delphi.scorers import EmbeddingScorer, DetectionScorer
 from delphi.clients import Offline
 from delphi.utils import load_tokenized_data
+
+
+def _detection_scorer_preprocess(result):
+    """``LatentDataset`` yields ``LatentRecord``; full pipeline uses ``ExplainerResult``."""
+    if isinstance(result, list):
+        result = result[0]
+    if isinstance(result, ExplainerResult):
+        record = result.record
+        record.explanation = result.explanation
+        record.extra_examples = record.not_active  # type: ignore[assignment]
+        return record
+    return result
 
 
 def load_moe_model(model_name: str, wrapper_path: str, load_in_8bit: bool = False):
@@ -233,12 +246,6 @@ def run_detection_scorer(
         verbose=True,
     )
 
-    def scorer_preprocess(result):
-        record = result.record
-        record.explanation = result.explanation
-        record.extra_examples = record.not_active
-        return record
-
     def scorer_postprocess(result, score_dir: Path):
         safe_latent_name = str(result.record.latent).replace("/", "--")
         with open(score_dir / f"{safe_latent_name}.txt", "wb") as f:
@@ -246,7 +253,7 @@ def run_detection_scorer(
 
     scorer_pipe = process_wrapper(
         scorer,
-        preprocess=scorer_preprocess,
+        preprocess=_detection_scorer_preprocess,
         postprocess=partial(scorer_postprocess, score_dir=output_path),
     )
 

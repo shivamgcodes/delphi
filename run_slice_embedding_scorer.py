@@ -95,6 +95,7 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
 from delphi.config import CacheConfig, ConstructorConfig, SamplerConfig
+from delphi.explainers.explainer import ExplainerResult
 from delphi.latents import LatentDataset
 from delphi.latents.cache_slice import RoutingMode, SliceLatentCache
 from delphi.latents.slice_adapter import load_slice_model, load_training_config
@@ -284,6 +285,18 @@ def run_embedding_scorer(
     print(f"Scores saved to {output_path}")
 
 
+def _detection_scorer_preprocess(result):
+    """``LatentDataset`` yields ``LatentRecord``; full Delphi pipeline uses ``ExplainerResult``."""
+    if isinstance(result, list):
+        result = result[0]
+    if isinstance(result, ExplainerResult):
+        record = result.record
+        record.explanation = result.explanation
+        record.extra_examples = record.not_active  # type: ignore[assignment]
+        return record
+    return result
+
+
 def run_detection_scorer(
     latents_path: Path,
     output_path: Path,
@@ -327,12 +340,6 @@ def run_detection_scorer(
         verbose=True,
     )
 
-    def scorer_preprocess(result):
-        record = result.record
-        record.explanation = result.explanation
-        record.extra_examples = record.not_active
-        return record
-
     def scorer_postprocess(result, score_dir: Path):
         safe_latent_name = str(result.record.latent).replace("/", "--")
         with open(score_dir / f"{safe_latent_name}.txt", "wb") as f:
@@ -340,7 +347,7 @@ def run_detection_scorer(
 
     scorer_pipe = process_wrapper(
         scorer,
-        preprocess=scorer_preprocess,
+        preprocess=_detection_scorer_preprocess,
         postprocess=partial(scorer_postprocess, score_dir=output_path),
     )
 
