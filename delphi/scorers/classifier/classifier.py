@@ -145,11 +145,12 @@ class Classifier(Scorer):
             raise ValueError("No match found in string")
         raw_predictions: list[bool | Literal[0, 1]] = json.loads(match.group(0))
         predictions = [bool(prediction) for prediction in raw_predictions]
-        assert len(predictions) == self.n_examples_shown
+        # Some batches can contain fewer examples than `self.n_examples_shown`
+        # (e.g. the last batch), so don't hard-assert the length here.
         probabilities = (
             self._parse_logprobs(logprobs)
             if logprobs is not None
-            else [None] * self.n_examples_shown
+            else [None] * len(predictions)
         )
 
         return predictions, probabilities
@@ -187,8 +188,6 @@ class Classifier(Scorer):
                     binary_probabilities.append(prob_1 / (prob_0 + prob_1))
                 else:
                     binary_probabilities.append(0.0)
-
-        assert len(binary_probabilities) == self.n_examples_shown
         return binary_probabilities
 
     def _build_prompt(
