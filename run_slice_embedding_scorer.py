@@ -23,6 +23,10 @@ Override paths or use a config URL:
         --config https://huggingface.co/.../config.json \\
         --hf_cache_dir ~/.cache/delphi/slice_hf
 
+On RunPod-style hosts with ``/workspace``, Hugging Face downloads use
+``HF_HOME=/workspace/.cache/huggingface`` when ``HF_HOME`` is not already set
+(so ``/root`` does not fill). Override with ``export HF_HOME=...`` if needed.
+
 MMLU tokens (like slice's lm_eval ``mmlu_*_continuation`` style prompts):
 
     python run_slice_embedding_scorer.py \\
@@ -63,6 +67,46 @@ from delphi.utils import load_tokenized_data
 from delphi.latents.mmlu_tokens import MMLU_REPO, load_mmlu_tokenized_data
 
 
+def _default_disk_base() -> Path:
+    """Use ``/workspace`` when present (RunPod / vast.ai); else the user's home."""
+    ws = Path("/workspace")
+    return ws if ws.is_dir() else Path.home()
+
+
+def _cache_inference_dtype(name: str) -> "torch.dtype":
+    """Dtype for SLICE MoE forward during activation caching (after ZeRO merge)."""
+    if name == "float32":
+        return torch.float32
+    if name == "bfloat16":
+        return torch.bfloat16
+    if name == "float16":
+        return torch.float16
+    # auto
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float32
+
+
+def _configure_hf_home_for_workspace() -> None:
+    """
+    Dataset Hub blobs and ``from_pretrained`` caches default to ``HF_HOME`` (often
+    ``/root/.cache/huggingface``), which fills the root FS on small RunPod images.
+    If ``HF_HOME`` is unset/empty and ``/workspace`` exists, pin it under
+    ``/workspace/.cache/huggingface``.
+    """
+    if os.environ.get("HF_HOME"):
+        return
+    ws = Path("/workspace")
+    if not ws.is_dir():
+        return
+    hf_home = ws / ".cache" / "huggingface"
+    hf_home.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(hf_home)
+    print(
+        f"HF_HOME -> {hf_home} (large Hub downloads; set HF_HOME yourself to override)"
+    )
+
+
 def _latent_hookpoint_dirs(latents_path: Path) -> list[str]:
     """Return sorted cache module names (subdirs, e.g. ``moe_layer_0``)."""
     if not latents_path.is_dir():
@@ -77,7 +121,7 @@ def cache_slice_activations(
     output_path: Path,
     routing_mode: RoutingMode,
     n_tokens: int = 10_000_000,
-    batch_size: int = 32,
+    batch_size: int = 4,
     ctx_len: int = 256,
     dataset_repo: str = "EleutherAI/SmolLM2-135M-10B",
     dataset_split: str = "train[:10000]",
@@ -285,6 +329,8 @@ def run_detection_scorer(
 
 
 def main():
+    _configure_hf_home_for_workspace()
+
     parser = argparse.ArgumentParser(
         description="Run embedding/detection scoring on SLICE MoE checkpoints"
     )
@@ -317,8 +363,9 @@ def main():
     parser.add_argument(
         "--hf_cache_dir",
         type=str,
-        default=str(Path.home() / ".cache" / "delphi" / "slice_hf"),
-        help="Local root where config.json and checkpoint_final/ are stored",
+        default=str(_default_disk_base() / ".cache" / "delphi" / "slice_hf"),
+        help="Local root where config.json and checkpoint_final/ are stored "
+        "(default: under /workspace/.cache/... when /workspace exists)",
     )
     parser.add_argument(
         "--hf_revision",
@@ -377,14 +424,28 @@ def main():
         default="meta-llama/Meta-Llama-3.1-8B-Instruct",
     )
     parser.add_argument("--skip_cache", action="store_true")
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Forward batch size during SLICE latent caching. Cross-segment MoE einsums "
+        "scale ~linearly with this; try 2–8 if CUDA OOM (default 4).",
+    )
     parser.add_argument("--ctx_len", type=int, default=256)
+    parser.add_argument(
+        "--cache_inference_dtype",
+        type=str,
+        choices=["auto", "float32", "bfloat16", "float16"],
+        default="auto",
+        help="Model dtype while caching router activations only (after fp32 ZeRO merge). "
+        "auto=bfloat16 on CUDA when supported (~half activation VRAM). float32 uses more memory.",
+    )
     parser.add_argument(
         "--hf_datasets_cache",
         type=str,
         default=None,
-        help="Directory for Hugging Face ``datasets`` downloads (can be tens of GB for "
-        "large corpora). Default: env / platform cache. Example: /workspace/hf_datasets_cache",
+        help="Passed as ``cache_dir`` to ``load_dataset``. Default: unset — then "
+        "``datasets`` uses ``HF_HOME`` (see startup message when /workspace exists).",
     )
     parser.add_argument(
         "--dataset_repo",
@@ -433,11 +494,12 @@ def main():
     args = parser.parse_args()
     routing_mode: RoutingMode = args.routing_mode  # type: ignore[assignment]
 
-    datasets_cache_dir = (
-        str(Path(args.hf_datasets_cache).expanduser().resolve())
-        if args.hf_datasets_cache
-        else None
-    )
+    if args.hf_datasets_cache:
+        datasets_cache_dir = str(Path(args.hf_datasets_cache).expanduser().resolve())
+    elif os.environ.get("HF_HOME"):
+        datasets_cache_dir = str(Path(os.environ["HF_HOME"]) / "datasets")
+    else:
+        datasets_cache_dir = None
 
     hf_token = args.hf_token if args.hf_token else os.environ.get("HF_TOKEN")
     if hf_token is not None and hf_token == "":
@@ -476,6 +538,10 @@ def main():
     if need_slice_cache:
         print("\n=== Caching SLICE router activations ===")
         model, moe_layers, train_cfg = load_slice_model(training_config, weights_path)
+        cid = _cache_inference_dtype(args.cache_inference_dtype)
+        if cid != torch.float32:
+            print(f"Casting model to {cid} for caching (use --cache_inference_dtype float32 to disable)")
+            model = model.to(dtype=cid)
         m_seg = train_cfg.moe.num_segments
         n_exp = train_cfg.moe.num_experts
         slice_extra = {
