@@ -23,9 +23,10 @@ Override paths or use a config URL:
         --config https://huggingface.co/.../config.json \\
         --hf_cache_dir ~/.cache/delphi/slice_hf
 
-On RunPod-style hosts with ``/workspace``, Hugging Face downloads use
-``HF_HOME=/workspace/.cache/huggingface`` when ``HF_HOME`` is not already set
-(so ``/root`` does not fill). Override with ``export HF_HOME=...`` if needed.
+On RunPod-style hosts with ``/workspace``, this script sets (when unset) ``HF_HOME``,
+``TMPDIR``, ``TORCHINDUCTOR_CACHE_DIR``, and ``TRITON_CACHE_DIR`` under
+``/workspace/.cache/...`` so Hub data and vLLM/torch Inductor compiles do not fill the
+small root ``/tmp``. Override with env vars if needed.
 
 MMLU tokens (like slice's lm_eval ``mmlu_*_continuation`` style prompts):
 
@@ -85,6 +86,38 @@ def _cache_inference_dtype(name: str) -> "torch.dtype":
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     return torch.float32
+
+
+def _configure_tmp_and_compiler_cache_for_workspace() -> None:
+    """
+    vLLM + torch.compile / Inductor + Triton write large temp files under ``/tmp``
+    (e.g. ``/tmp/torchinductor_root/...``). On RunPod, ``/`` is often tiny and fills
+    with errno 28 while ``/workspace`` is large. Redirect when ``/workspace`` exists
+    and the user has not set these variables.
+    """
+    ws = Path("/workspace")
+    if not ws.is_dir():
+        return
+    base = ws / ".cache"
+    tmp = base / "tmp"
+    inductor = base / "torchinductor"
+    triton = base / "triton"
+    for d in (tmp, inductor, triton):
+        d.mkdir(parents=True, exist_ok=True)
+
+    if not os.environ.get("TMPDIR"):
+        os.environ["TMPDIR"] = str(tmp)
+        os.environ.setdefault("TEMP", str(tmp))
+        os.environ.setdefault("TMP", str(tmp))
+    if not os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(inductor)
+    if not os.environ.get("TRITON_CACHE_DIR"):
+        os.environ["TRITON_CACHE_DIR"] = str(triton)
+
+    print(
+        f"Compile/temp caches -> {base} (TMPDIR, TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR; "
+        "avoids filling /tmp on small root disks)"
+    )
 
 
 def _configure_hf_home_for_workspace() -> None:
@@ -329,6 +362,7 @@ def run_detection_scorer(
 
 
 def main():
+    _configure_tmp_and_compiler_cache_for_workspace()
     _configure_hf_home_for_workspace()
 
     parser = argparse.ArgumentParser(
