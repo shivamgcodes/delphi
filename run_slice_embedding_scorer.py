@@ -244,12 +244,15 @@ def _build_dataset(
     latent_range: torch.Tensor | None,
     n_non_activating: int = 50,
     sampler_cfg: SamplerConfig | None = None,
+    constructor_cfg: ConstructorConfig | None = None,
 ) -> LatentDataset:
     latent_dict = {hook: latent_range for hook in hookpoints} if latent_range is not None else None
+    if constructor_cfg is None:
+        constructor_cfg = ConstructorConfig(n_non_activating=n_non_activating)
     return LatentDataset(
         raw_dir=latents_path,
         sampler_cfg=sampler_cfg if sampler_cfg is not None else SamplerConfig(),
-        constructor_cfg=ConstructorConfig(n_non_activating=n_non_activating),
+        constructor_cfg=constructor_cfg,
         modules=hookpoints,
         latents=latent_dict,
         tokenizer=tokenizer,
@@ -277,6 +280,7 @@ def run_explainer(
     latent_range: torch.Tensor | None = None,
     n_non_activating: int = 50,
     sampler_cfg: SamplerConfig | None = None,
+    constructor_cfg: ConstructorConfig | None = None,
 ) -> None:
     """
     Run ``DefaultExplainer`` over all latents and save per-latent explanations to disk.
@@ -292,6 +296,7 @@ def run_explainer(
         latent_range,
         n_non_activating,
         sampler_cfg=sampler_cfg,
+        constructor_cfg=constructor_cfg,
     )
     explainer = DefaultExplainer(client, threshold=0.3, verbose=True)
 
@@ -503,16 +508,23 @@ def main():
     parser.add_argument(
         "--explainer_n_examples_train",
         type=int,
-        default=18,
+        default=8,
         help="Sampler n_examples_train for the explainer stage only (DefaultExplainer + "
-        "few-shot makes long prompts; default is reduced so 4k-context models can run). "
-        "Scorers still use the full SamplerConfig (40/50).",
+        "3× few-shot chat turns inflate tokens; default fits ~4k vLLM caps). "
+        "Scorers still use the full SamplerConfig (40/50). Lower further if you still overflow.",
     )
     parser.add_argument(
         "--explainer_n_examples_test",
         type=int,
-        default=20,
+        default=10,
         help="Sampler n_examples_test for the explainer stage only.",
+    )
+    parser.add_argument(
+        "--explainer_example_ctx_len",
+        type=int,
+        default=16,
+        help="Constructor example_ctx_len for the explainer stage only (shorter text per "
+        "example). Must divide latent cache --ctx_len (default 256); try 8, 16, or 32.",
     )
     parser.add_argument("--skip_cache", action="store_true")
     parser.add_argument(
@@ -717,6 +729,11 @@ def main():
     # --- Explainer stage ---
     print("\n=== Explainer stage ===")
     print(f"Loading explainer/scorer model: {args.explainer_model}")
+    if args.explainer_max_model_len <= 4096:
+        print(
+            "Note: --explainer_max_model_len <= 4096. If you are on Llama 3.x, pass "
+            "--explainer_max_model_len 8192 (or higher) so vLLM is not capped at 4k."
+        )
     llm_client = Offline(
         args.explainer_model,
         max_memory=args.max_memory,
@@ -737,6 +754,15 @@ def main():
             n_examples_train=args.explainer_n_examples_train,
             n_examples_test=args.explainer_n_examples_test,
         )
+        explainer_constructor = ConstructorConfig(
+            n_non_activating=args.n_non_activating,
+            example_ctx_len=args.explainer_example_ctx_len,
+        )
+        if args.ctx_len % args.explainer_example_ctx_len != 0:
+            raise ValueError(
+                f"--explainer_example_ctx_len ({args.explainer_example_ctx_len}) must divide "
+                f"--ctx_len ({args.ctx_len}) used when the latent cache was built."
+            )
         run_explainer(
             latents_path=latents_path,
             explanations_path=explanations_path,
@@ -746,6 +772,7 @@ def main():
             latent_range=latent_range,
             n_non_activating=args.n_non_activating,
             sampler_cfg=explainer_sampler,
+            constructor_cfg=explainer_constructor,
         )
         explainer_pipe = _make_explanation_pipe(explanations_path)
 
