@@ -23,10 +23,10 @@ Override paths or use a config URL:
         --config https://huggingface.co/.../config.json \\
         --hf_cache_dir ~/.cache/delphi/slice_hf
 
-On RunPod-style hosts with ``/workspace``, this script sets (when unset) ``HF_HOME``,
-``TMPDIR``, ``TORCHINDUCTOR_CACHE_DIR``, and ``TRITON_CACHE_DIR`` under
-``/workspace/.cache/...`` so Hub data and vLLM/torch Inductor compiles do not fill the
-small root ``/tmp``. Override with env vars if needed.
+On RunPod-style hosts with ``/workspace``, this module sets (when unset) ``HF_HOME``,
+``VLLM_CACHE_ROOT`` (where ``torch_compile_cache`` lives), ``TMPDIR``,
+``TORCHINDUCTOR_CACHE_DIR``, and ``TRITON_CACHE_DIR`` under ``/workspace/.cache/...``
+**before** importing vLLM. Override with env vars if needed.
 
 MMLU tokens (like slice's lm_eval ``mmlu_*_continuation`` style prompts):
 
@@ -46,6 +46,48 @@ import json
 import os
 from functools import partial
 from pathlib import Path
+
+
+def _apply_workspace_disk_caches_early() -> None:
+    """
+    RunPod: ``/`` and ``/root/.cache`` are tiny; ``/workspace`` is large. vLLM reads
+    ``VLLM_CACHE_ROOT`` at import time (defaults to ``~/.cache/vllm``), so this must run
+    **before** ``delphi.clients.offline`` imports vLLM. Same for ``HF_HOME``, Inductor,
+    and Triton temp paths.
+    """
+    ws = Path("/workspace")
+    if not ws.is_dir():
+        return
+    base = ws / ".cache"
+    tmp = base / "tmp"
+    inductor = base / "torchinductor"
+    triton = base / "triton"
+    vllm_root = base / "vllm"
+    hf_home = base / "huggingface"
+    for d in (tmp, inductor, triton, vllm_root, hf_home):
+        d.mkdir(parents=True, exist_ok=True)
+
+    if not os.environ.get("TMPDIR"):
+        os.environ["TMPDIR"] = str(tmp)
+        os.environ.setdefault("TEMP", str(tmp))
+        os.environ.setdefault("TMP", str(tmp))
+    if not os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(inductor)
+    if not os.environ.get("TRITON_CACHE_DIR"):
+        os.environ["TRITON_CACHE_DIR"] = str(triton)
+    if not os.environ.get("VLLM_CACHE_ROOT"):
+        os.environ["VLLM_CACHE_ROOT"] = str(vllm_root)
+    if not os.environ.get("HF_HOME"):
+        os.environ["HF_HOME"] = str(hf_home)
+
+    print(
+        f"Workspace caches under {base}: "
+        f"HF_HOME, VLLM_CACHE_ROOT (torch_compile_cache), TMPDIR, …",
+        flush=True,
+    )
+
+
+_apply_workspace_disk_caches_early()
 
 import orjson
 import torch
@@ -86,58 +128,6 @@ def _cache_inference_dtype(name: str) -> "torch.dtype":
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     return torch.float32
-
-
-def _configure_tmp_and_compiler_cache_for_workspace() -> None:
-    """
-    vLLM + torch.compile / Inductor + Triton write large temp files under ``/tmp``
-    (e.g. ``/tmp/torchinductor_root/...``). On RunPod, ``/`` is often tiny and fills
-    with errno 28 while ``/workspace`` is large. Redirect when ``/workspace`` exists
-    and the user has not set these variables.
-    """
-    ws = Path("/workspace")
-    if not ws.is_dir():
-        return
-    base = ws / ".cache"
-    tmp = base / "tmp"
-    inductor = base / "torchinductor"
-    triton = base / "triton"
-    for d in (tmp, inductor, triton):
-        d.mkdir(parents=True, exist_ok=True)
-
-    if not os.environ.get("TMPDIR"):
-        os.environ["TMPDIR"] = str(tmp)
-        os.environ.setdefault("TEMP", str(tmp))
-        os.environ.setdefault("TMP", str(tmp))
-    if not os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(inductor)
-    if not os.environ.get("TRITON_CACHE_DIR"):
-        os.environ["TRITON_CACHE_DIR"] = str(triton)
-
-    print(
-        f"Compile/temp caches -> {base} (TMPDIR, TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR; "
-        "avoids filling /tmp on small root disks)"
-    )
-
-
-def _configure_hf_home_for_workspace() -> None:
-    """
-    Dataset Hub blobs and ``from_pretrained`` caches default to ``HF_HOME`` (often
-    ``/root/.cache/huggingface``), which fills the root FS on small RunPod images.
-    If ``HF_HOME`` is unset/empty and ``/workspace`` exists, pin it under
-    ``/workspace/.cache/huggingface``.
-    """
-    if os.environ.get("HF_HOME"):
-        return
-    ws = Path("/workspace")
-    if not ws.is_dir():
-        return
-    hf_home = ws / ".cache" / "huggingface"
-    hf_home.mkdir(parents=True, exist_ok=True)
-    os.environ["HF_HOME"] = str(hf_home)
-    print(
-        f"HF_HOME -> {hf_home} (large Hub downloads; set HF_HOME yourself to override)"
-    )
 
 
 def _latent_hookpoint_dirs(latents_path: Path) -> list[str]:
@@ -362,9 +352,6 @@ def run_detection_scorer(
 
 
 def main():
-    _configure_tmp_and_compiler_cache_for_workspace()
-    _configure_hf_home_for_workspace()
-
     parser = argparse.ArgumentParser(
         description="Run embedding/detection scoring on SLICE MoE checkpoints"
     )
